@@ -7,10 +7,14 @@ from utils.helper import EXTRA_TEXT_MODELS, IMAGE_MODELS
 
 
 def list_models() -> dict[str, Any]:
-    result = OpenAIBackendAPI().list_models()
+    try:
+        result = OpenAIBackendAPI().list_models()
+    except Exception:
+        result = {"object": "list", "data": []}
     data = result.get("data")
     if not isinstance(data, list):
-        return result
+        data = []
+        result["data"] = data
     seen = {str(item.get("id") or "").strip() for item in data if isinstance(item, dict)}
     for model in sorted(IMAGE_MODELS | EXTRA_TEXT_MODELS):
         if model not in seen:
