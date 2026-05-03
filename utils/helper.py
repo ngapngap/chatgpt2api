@@ -12,6 +12,31 @@ from fastapi import HTTPException
 from utils.log import logger
 
 IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
+
+EXTRA_TEXT_MODELS = {
+    "gpt-5-5-pro",
+    "gpt-5-5-thinking",
+    "gpt-5-4-pro",
+    "gpt-5-4-thinking",
+    "gpt-5-4-t-mini",
+    "gpt-5-3-instant",
+    "gpt-5-2-pro",
+    "gpt-5-2-thinking",
+    "gpt-5-2-instant",
+    "agent-mode",
+    "research",
+    "o3",
+    "o3-pro",
+}
+
+PRO_MODELS = {
+    "gpt-5-5-pro",
+    "gpt-5-5-thinking",
+    "gpt-5-4-pro",
+    "gpt-5-4-thinking",
+    "gpt-5-2-pro",
+}
+
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 

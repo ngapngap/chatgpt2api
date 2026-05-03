@@ -17,7 +17,7 @@ from services.log_service import (
 )
 from services.proxy_service import proxy_settings
 from services.storage.base import StorageBackend
-from utils.helper import anonymize_token
+from utils.helper import PRO_MODELS, anonymize_token
 
 
 class AccountService:
@@ -278,12 +278,18 @@ class AccountService:
                 f"status={account.get('status') if account else 'unknown'}"
             )
 
-    def get_text_access_token(self) -> str:
+    def get_text_access_token(self, model: str = "") -> str:
+        require_pro = model in PRO_MODELS
         with self._lock:
             for account in self._accounts:
                 status = self._clean_token(account.get("status"))
-                if status not in {"禁用", "异常"}:
-                    return self._clean_token(account.get("access_token"))
+                if status in {"禁用", "异常"}:
+                    continue
+                if require_pro:
+                    account_type = self._clean_token(account.get("type"))
+                    if account_type not in {"Pro", "Team"}:
+                        continue
+                return self._clean_token(account.get("access_token"))
         return ""
 
     def remove_invalid_token(self, access_token: str, event: str) -> bool:
