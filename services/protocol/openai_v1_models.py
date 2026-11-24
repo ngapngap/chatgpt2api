@@ -4,14 +4,18 @@ from typing import Any
 
 from services.account_service import account_service
 from services.openai_backend_api import OpenAIBackendAPI
-from utils.helper import CODEX_IMAGE_MODEL
+from utils.helper import CODEX_IMAGE_MODEL, EXTRA_TEXT_MODELS, IMAGE_MODELS
 
 
 def list_models() -> dict[str, Any]:
-    result = OpenAIBackendAPI().list_models()
+    try:
+        result = OpenAIBackendAPI().list_models()
+    except Exception:
+        result = {"object": "list", "data": []}
     data = result.get("data")
     if not isinstance(data, list):
-        return result
+        data = []
+        result["data"] = data
     seen = {str(item.get("id") or "").strip() for item in data if isinstance(item, dict)}
     dynamic_models: set[str] = set()
     accounts = account_service.list_accounts()
@@ -39,7 +43,7 @@ def list_models() -> dict[str, Any]:
     if "Pro" in codex_types:
         dynamic_models.add(f"pro-{CODEX_IMAGE_MODEL}")
 
-    for model in sorted(dynamic_models):
+    for model in sorted(IMAGE_MODELS | dynamic_models | EXTRA_TEXT_MODELS):
         if model not in seen:
             data.append({
                 "id": model,

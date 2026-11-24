@@ -18,7 +18,7 @@ from services.log_service import (
     log_service,
 )
 from services.storage.base import StorageBackend
-from utils.helper import anonymize_token
+from utils.helper import PRO_MODELS, anonymize_token
 
 
 class AccountService:
@@ -1000,16 +1000,28 @@ class AccountService:
             if plan_type or source_type else f"no available image quota (tried {len(attempted_tokens)} tokens)"
         )
 
-    def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
+    def get_text_access_token(self, excluded_tokens: set[str] | None = None, model: str = "") -> str:
         excluded = set(excluded_tokens or set())
+        require_pro = model in PRO_MODELS
         with self._lock:
-            candidates = [
-                token
-                for account in self._accounts.values()
-                if account.get("status") not in {"禁用", "异常"}
-                   and (token := account.get("access_token") or "")
-                   and token not in excluded
-            ]
+            now = datetime.now(timezone.utc)
+            available: list[str] = []
+            limited: list[str] = []
+            for account in self._accounts.values():
+                token = account.get("access_token") or ""
+                if not token or token in excluded:
+                    continue
+                if account.get("status") in {"禁用", "异常"}:
+                    continue
+                if require_pro and str(account.get("type") or "").strip() not in {"Pro", "Team"}:
+                    continue
+                until = self._parse_time(account.get("text_limited_until"))
+                if until is not None and until > now:
+                    limited.append(token)
+                else:
+                    available.append(token)
+            # Prefer available accounts; if all are cooling down, retry them anyway.
+            candidates = available or limited
             if not candidates:
                 return ""
             access_token = candidates[self._index % len(candidates)]

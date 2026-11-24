@@ -23,6 +23,41 @@ PREFIXED_CODEX_IMAGE_MODELS = {
 }
 IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
 PUBLIC_IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
+
+EXTRA_TEXT_MODELS = {
+    "gpt-5.5-pro",
+    "gpt-5.5-thinking",
+    "gpt-5-5-pro",
+    "gpt-5-5-thinking",
+    "gpt-5.4-pro",
+    "gpt-5.4-thinking",
+    "gpt-5-4-pro",
+    "gpt-5-4-thinking",
+    "gpt-5-4-t-mini",
+    "gpt-5-3-instant",
+    "gpt-5.2-pro",
+    "gpt-5.2-thinking",
+    "gpt-5-2-pro",
+    "gpt-5-2-thinking",
+    "gpt-5-2-instant",
+    "agent-mode",
+    "research",
+    "o3",
+    "o3-pro",
+}
+
+PRO_MODELS = {
+    "gpt-5.5-pro",
+    "gpt-5.5-thinking",
+    "gpt-5-5-pro",
+    "gpt-5-5-thinking",
+    "gpt-5.4-pro",
+    "gpt-5-4-pro",
+    "gpt-5-4-thinking",
+    "gpt-5.2-pro",
+    "gpt-5-2-pro",
+}
+
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
