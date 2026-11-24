@@ -7,6 +7,7 @@ import json
 import re
 import threading
 import time
+import zlib
 from typing import Callable, Mapping
 from urllib import request as urllib_request
 from urllib.parse import quote, urlparse
@@ -197,8 +198,20 @@ class ProxySettingsStore:
             selected_proxy = account_proxy
             source = "account"
         elif runtime_proxy:
-            selected_proxy = runtime_proxy
-            source = runtime_proxy_source
+            # Sticky per-account sharding across a proxy pool: the same account
+            # always maps to the same egress, and new accounts land automatically.
+            pool = runtime.get("proxy_pool")
+            sharded = ""
+            if upstream and runtime_enabled and egress_mode == "single_proxy" and isinstance(pool, list) and pool:
+                key = str((account or {}).get("email") or (account or {}).get("access_token") or "")
+                if key:
+                    sharded = str(pool[zlib.crc32(key.encode()) % len(pool)] or "").strip()
+            if sharded:
+                selected_proxy = sharded
+                source = "runtime_pool"
+            else:
+                selected_proxy = runtime_proxy
+                source = runtime_proxy_source
         elif explicit_proxy:
             selected_proxy = explicit_proxy
             source = "explicit"

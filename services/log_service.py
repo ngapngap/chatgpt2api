@@ -60,6 +60,32 @@ class LogService:
             return False
         return True
 
+    # The log is a plain append-only JSONL file that only ever grows: nothing
+    # rotated it, so it reached 1.7 GB. Roll it once it passes MAX_BYTES and
+    # keep a couple of generations, so disk use stays bounded without losing
+    # recent history.
+    MAX_BYTES = 200 * 1024 * 1024
+    KEEP_GENERATIONS = 3
+
+    def _rotate_if_needed(self) -> None:
+        try:
+            if not self.path.exists() or self.path.stat().st_size < self.MAX_BYTES:
+                return
+        except OSError:
+            return
+        for index in range(self.KEEP_GENERATIONS - 1, 0, -1):
+            older = self.path.with_suffix(self.path.suffix + f".{index}")
+            newer = self.path.with_suffix(self.path.suffix + f".{index + 1}")
+            if older.exists():
+                try:
+                    older.replace(newer)
+                except OSError:
+                    pass
+        try:
+            self.path.replace(self.path.with_suffix(self.path.suffix + ".1"))
+        except OSError:
+            pass
+
     def add(self, type: str, summary: str = "", detail: dict[str, Any] | None = None, **data: Any) -> None:
         item = {
             "id": uuid4().hex,
@@ -68,6 +94,7 @@ class LogService:
             "summary": summary,
             "detail": detail or data,
         }
+        self._rotate_if_needed()
         with self.path.open("a", encoding="utf-8") as file:
             file.write(self._serialize_item(item) + "\n")
 

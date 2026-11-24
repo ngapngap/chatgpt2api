@@ -246,6 +246,11 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
         "egress_mode": egress_mode,
         "proxy_url": str(source.get("proxy_url") or "").strip(),
         "resource_proxy_url": str(source.get("resource_proxy_url") or "").strip(),
+        "proxy_pool": [
+            str(item).strip()
+            for item in (source.get("proxy_pool") if isinstance(source.get("proxy_pool"), list) else []) or []
+            if str(item).strip()
+        ],
         "skip_ssl_verify": _normalize_bool(
             source.get("skip_ssl_verify"),
             bool(DEFAULT_PROXY_RUNTIME["skip_ssl_verify"]),
@@ -467,6 +472,18 @@ class ConfigStore:
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
+
+    @property
+    def text_429_cooldown_minutes(self) -> int:
+        try:
+            return max(1, int(float(self.data.get("text_429_cooldown_minutes", 30))))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 30
+
+    @property
+    def mail_code_worker_url(self) -> str:
+        value = str(self.data.get("mail_code_worker_url", "") or "").strip()
+        return value
 
     @property
     def auto_relogin_after_refresh(self) -> bool:

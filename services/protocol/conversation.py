@@ -76,6 +76,12 @@ def is_token_invalid_error(message: str) -> bool:
     )
 
 
+def is_rate_limit_error(message: str) -> bool:
+    """True when the upstream error is an HTTP 429 rate-limit response."""
+    text = str(message or "")
+    return "status=429" in text or "429" in text and "rate" in text.lower()
+
+
 def is_tls_connection_error(message: str) -> bool:
     """检测 TLS/SSL 连接错误，这类错误通常可以通过重试解决。"""
     text = str(message or "").lower()
@@ -697,6 +703,13 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             return
         except Exception as exc:
             error_message = str(exc)
+            # Attach the account email so failure logs record which account was used.
+            try:
+                failed_account = account_service.get_account(token) or {}
+                if not getattr(exc, "account_email", ""):
+                    exc.__dict__["account_email"] = str(failed_account.get("email") or "")
+            except Exception:
+                pass
             if token and not emitted and is_token_invalid_error(error_message):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
                 if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
@@ -706,6 +719,15 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                     token = account_service.get_text_access_token(attempted_tokens)
                 if token:
                     continue
+            # Track consecutive 429s; the account is cooled down (not deleted) at the limit.
+            is_429 = is_rate_limit_error(error_message)
+            if token:
+                account_service.mark_text_failed(token, is_429=is_429, event="text_stream")
+                # 429 with nothing emitted yet: fail over to another account.
+                if is_429 and not emitted:
+                    token = account_service.get_text_access_token(attempted_tokens)
+                    if token:
+                        continue
             raise
 
 

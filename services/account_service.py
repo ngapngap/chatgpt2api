@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import json
+import re
 import secrets
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Condition, Lock, Thread
-from typing import Any
+from threading import Condition, Lock, RLock, Thread
+from typing import Any, Iterator
 from urllib.parse import urlencode
 
 from services.config import config
@@ -18,7 +21,8 @@ from services.log_service import (
     log_service,
 )
 from services.storage.base import StorageBackend
-from utils.helper import PRO_MODELS, anonymize_token
+from utils.helper import anonymize_token
+from utils.log import logger
 
 
 class AccountService:
@@ -31,6 +35,7 @@ class AccountService:
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE = 3
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
+    _CONSECUTIVE_429_LIMIT = 5
     _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
     _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
     _OAUTH_USER_AGENT = (
@@ -48,8 +53,16 @@ class AccountService:
 
     def __init__(self, storage_backend: StorageBackend):
         self.storage = storage_backend
-        self._lock = Lock()
-        self._token_refresh_lock = Lock()
+        # RLock, not Lock: several helpers take this lock while already holding
+        # it (update_account -> _save_accounts, release_image_slot from inside a
+        # locked section). A plain Lock turned those into a permanent
+        # self-deadlock the moment the pool got busy.
+        self._lock = RLock()
+        # Guards refreshes per access_token instead of globally: the old single
+        # lock was held across a 60 s HTTP call, so one slow refresh queued
+        # every worker in the process behind it.
+        self._token_refresh_guards: dict[str, Lock] = {}
+        self._token_refresh_guards_lock = Lock()
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
         self._accounts = self._load_accounts()
@@ -60,6 +73,22 @@ class AccountService:
     def _get_cumulative_file(self) -> Path:
         from services.config import DATA_DIR
         return DATA_DIR / ".cumulative_total"
+
+    def _get_accounts_lock_file(self) -> Path:
+        from services.config import DATA_DIR
+        return DATA_DIR / ".accounts.lock"
+
+    @contextmanager
+    def _accounts_file_lock(self, exclusive: bool = False) -> Iterator[None]:
+        """Cross-process lock so multi-worker reads/writes stay consistent."""
+        lock_path = self._get_accounts_lock_file()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _load_cumulative_total(self) -> int:
         try:
@@ -125,8 +154,25 @@ class AccountService:
             if (normalized := self._normalize_account(item)) is not None
         }
 
-    def _save_accounts(self) -> None:
-        self.storage.save_accounts(list(self._accounts.values()))
+    def _sync_accounts_from_storage_locked(self) -> None:
+        """Reload shared storage into process RAM so multi-worker pools stay consistent."""
+        with self._accounts_file_lock(exclusive=False):
+            self._accounts = self._load_accounts()
+
+    def _save_accounts(self, removed_tokens: set[str] | None = None) -> None:
+        # Atomic cross-worker write:
+        # exclusive lock -> reload latest storage -> apply local RAM mutations
+        # -> apply deletes -> write full snapshot back.
+        local_accounts = dict(self._accounts)
+        with self._accounts_file_lock(exclusive=True):
+            latest_storage_accounts = self._load_accounts()
+            merged_accounts = {**latest_storage_accounts, **local_accounts}
+            if removed_tokens:
+                for token in removed_tokens:
+                    merged_accounts.pop(token, None)
+                    local_accounts.pop(token, None)
+            self._accounts = merged_accounts
+            self.storage.save_accounts(list(self._accounts.values()))
 
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
@@ -235,6 +281,9 @@ class AccountService:
         normalized["success"] = int(normalized.get("success") or 0)
         normalized["fail"] = int(normalized.get("fail") or 0)
         normalized["invalid_count"] = int(normalized.get("invalid_count") or 0)
+        normalized["consecutive_429"] = int(normalized.get("consecutive_429") or 0)
+        normalized["text_limited_until"] = normalized.get("text_limited_until") or None
+        normalized["last_otp_relogin_at"] = normalized.get("last_otp_relogin_at") or None
         normalized["last_used_at"] = normalized.get("last_used_at")
         normalized["last_invalid_at"] = normalized.get("last_invalid_at") or None
         normalized["last_refresh_error"] = normalized.get("last_refresh_error") or None
@@ -437,21 +486,46 @@ class AccountService:
         )
         return new_token
 
+    def _token_refresh_guard(self, token: str) -> Lock:
+        """One guard per access_token, so refreshes of different accounts don't serialise."""
+        with self._token_refresh_guards_lock:
+            guard = self._token_refresh_guards.get(token)
+            if guard is None:
+                guard = Lock()
+                self._token_refresh_guards[token] = guard
+            return guard
+
     def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
         if not access_token:
             return ""
-        with self._token_refresh_lock:
-            resolved_token, account = self._get_account_for_token(access_token)
+        # Read the account and decide, without holding any lock across I/O.
+        resolved_token, account = self._get_account_for_token(access_token)
+        if not account:
+            return access_token
+        active_token = str(account.get("access_token") or resolved_token or access_token)
+        if not self._token_needs_refresh(active_token, force=force):
+            return active_token
+        refresh_token = str(account.get("refresh_token") or "").strip()
+        if not refresh_token:
+            return active_token
+        if not force and self._recent_token_refresh_error(account):
+            return active_token
+
+        # Only refreshes of THIS token serialise. The old global lock was held
+        # across the 60 s HTTP call below, which queued every worker in the
+        # process behind a single slow refresh.
+        with self._token_refresh_guard(active_token):
+            # Another thread may have refreshed it while we waited for the guard.
+            resolved_token, account = self._get_account_for_token(active_token)
             if not account:
-                return access_token
-            active_token = str(account.get("access_token") or resolved_token or access_token)
-            if not self._token_needs_refresh(active_token, force=force):
+                return active_token
+            active_token = str(account.get("access_token") or resolved_token or active_token)
+            if not force and not self._token_needs_refresh(active_token, force=False):
                 return active_token
             refresh_token = str(account.get("refresh_token") or "").strip()
             if not refresh_token:
                 return active_token
-            if not force and self._recent_token_refresh_error(account):
-                return active_token
+
             try:
                 token_data = self._request_access_token_refresh(refresh_token, account)
             except Exception as exc:
@@ -472,6 +546,53 @@ class AccountService:
                         t.start()
                 return active_token
             return self._apply_refreshed_tokens(active_token, token_data, event)
+
+    _OTP_RELOGIN_MIN_INTERVAL_SECS = 1800
+
+    @staticmethod
+    def _otp_relogin_allowed(account: dict) -> bool:
+        """OTP-only re-login is throttled: at most one attempt per 30 minutes."""
+        last = AccountService._parse_time(account.get("last_otp_relogin_at"))
+        if last is None:
+            return True
+        return (datetime.now(timezone.utc) - last).total_seconds() >= AccountService._OTP_RELOGIN_MIN_INTERVAL_SECS
+
+    def _otp_re_login_thread(self, access_token: str, email: str, event: str) -> None:
+        """Passwordless OTP re-login thread for accounts without a password."""
+        result = self._login_with_email_otp(email)
+        with self._lock:
+            current = self._accounts.get(self._resolve_access_token_locked(access_token))
+            if current is not None:
+                next_item = dict(current)
+                next_item["last_otp_relogin_at"] = datetime.now(timezone.utc).isoformat()
+                account = self._normalize_account(next_item)
+                if account is not None:
+                    self._accounts[self._resolve_access_token_locked(access_token)] = account
+                    self._save_accounts()
+        if not result.get("ok"):
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "OTP免密登录失败",
+                {"source": event, "email": email, "error": str(result.get("error"))},
+            )
+            return
+        token_data = {
+            "access_token": result["access_token"],
+            "refresh_token": result.get("refresh_token", ""),
+            "id_token": result.get("id_token", ""),
+        }
+        new_token = self._apply_refreshed_tokens(access_token, token_data, f"{event}:otp_relogin")
+        self.update_account(new_token, {"source_type": "email_otp", "status": "正常"}, quiet=True)
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "OTP免密登录成功",
+            {
+                "source": event,
+                "old_token": anonymize_token(access_token),
+                "new_token": anonymize_token(new_token),
+                "email": email,
+            },
+        )
 
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
         """密码重新登录线程入口"""
@@ -584,6 +705,346 @@ class AccountService:
             self.remove_invalid_token(access_token, f"{event}:password_relogin_exception", quiet=True)
             if progress_id:
                 self.update_relogin_progress(progress_id, access_token, "异常", str(exc))
+
+    # ---- Email OTP login (verification code via resend-code-filter Worker) ----
+
+    _MAIL_CODE_WORKER_URL = "https://resend-code-filter.dinhmainam.workers.dev"
+    _MAIL_CODE_WORKER_UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    _OTP_POLL_TIMEOUT_SECS = 95
+    _OTP_POLL_INTERVAL_SECS = 5
+
+    @staticmethod
+    def _parse_worker_codes(payload: object, email: str, service: str = "openai") -> dict | None:
+        """Extract the newest matching OTP entry from the Worker response.
+
+        Tolerates a bare list, a dict with a list under common keys, a dict of
+        services, or a single entry. Returns {"code", "to", "received_at"} or None.
+        """
+        entries: list = []
+        if isinstance(payload, list):
+            entries = payload
+        elif isinstance(payload, dict):
+            matched_list = None
+            for key in ("codes", "items", "entries", "mails", "results"):
+                if isinstance(payload.get(key), list):
+                    matched_list = payload[key]
+                    break
+            if matched_list is not None:
+                entries = matched_list
+            elif isinstance(payload.get("code"), (str, int)):
+                entries = [payload]
+            elif isinstance(payload.get("services"), list):
+                entries = payload["services"]
+            elif isinstance(payload.get("services"), dict):
+                entries = list(payload["services"].values())
+        email_lc = str(email or "").strip().lower()
+        service_lc = str(service or "").strip().lower()
+        best: dict | None = None
+        best_ts = float("-inf")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_service = str(entry.get("service") or "").strip().lower()
+            if entry_service and service_lc and entry_service != service_lc:
+                continue
+            to = str(entry.get("to") or entry.get("email") or "").strip().lower()
+            if email_lc and to and to != email_lc and to.split("@")[0] != email_lc.split("@")[0]:
+                continue
+            raw = str(entry.get("code") or entry.get("otp") or entry.get("verification_code") or "").strip()
+            if not raw:
+                continue
+            if re.fullmatch(r"\d{4,8}", raw) or re.fullmatch(r"[A-Z0-9]{4,8}", raw):
+                code = raw
+            else:
+                m = re.search(r"\b\d{6}\b", raw) or re.search(r"\b\d{4,8}\b", raw) or re.search(r"\b[A-Z0-9]{4,8}\b", raw)
+                code = m.group(0) if m else ""
+            if not code:
+                continue
+            received_at = entry.get("received_at") or entry.get("time") or entry.get("timestamp") or 0
+            try:
+                ts = float(received_at)
+            except (TypeError, ValueError):
+                try:
+                    ts = datetime.fromisoformat(str(received_at).replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    ts = 0
+            if ts >= best_ts:
+                best = {"code": code, "to": to, "received_at": received_at}
+                best_ts = ts
+        return best
+
+    def _login_email_otp(
+        self,
+        session: Any,
+        device_id: str,
+        email: str,
+        user_agent: str,
+        login_headers: dict,
+    ) -> dict:
+        """Handle OpenAI email_otp_verification during password login.
+
+        Sends the OTP email, polls the resend-code-filter Worker for the code,
+        validates it and returns the OAuth authorization code from continue_url.
+        """
+        auth_base = "https://auth.openai.com"
+        worker_url = str(getattr(config, "mail_code_worker_url", "") or "").strip().rstrip("/") or self._MAIL_CODE_WORKER_URL
+        headers = dict(login_headers)
+        headers["referer"] = f"{auth_base}/email-verification"
+        headers["oai-device-id"] = device_id
+
+        send_resp = session.get(
+            f"{auth_base}/api/accounts/email-otp/send",
+            headers=headers,
+            allow_redirects=True,
+            timeout=30,
+        )
+        if send_resp.status_code not in (200, 302):
+            return {"ok": False, "error": f"otp_send_failed_{send_resp.status_code}", "detail": self._safe_response_text(send_resp)}
+        logger.info({"event": "otp_send_ok", "email": email, "worker": worker_url})
+
+        deadline = time.time() + self._OTP_POLL_TIMEOUT_SECS
+        code = ""
+        raw_payload: object = None
+        while time.time() < deadline:
+            try:
+                poll_resp = session.get(
+                    f"{worker_url}/code?service=openai",
+                    headers={"user-agent": self._MAIL_CODE_WORKER_UA, "accept": "application/json"},
+                    timeout=15,
+                )
+                raw_payload = poll_resp.json() if poll_resp.status_code == 200 else None
+                match = self._parse_worker_codes(raw_payload, email)
+                if match:
+                    code = str(match.get("code") or "")
+                    break
+            except Exception as exc:
+                logger.warning({"event": "otp_poll_error", "email": email, "error": str(exc)})
+            time.sleep(self._OTP_POLL_INTERVAL_SECS)
+        if not code:
+            logger.warning({"event": "otp_poll_timeout", "email": email, "worker": worker_url, "payload": str(raw_payload)[:400]})
+            return {"ok": False, "error": "otp_code_timeout", "detail": {"worker": worker_url, "email": email}}
+        logger.info({"event": "otp_code_received", "email": email})
+
+        validate_url = f"{auth_base}/api/accounts/email-otp/validate"
+        validate_resp = session.post(validate_url, headers=headers, json={"code": code}, timeout=30)
+        if validate_resp.status_code != 200:
+            try:
+                from utils.sentinel import build_sentinel_token
+                sentinel_val, oai_sc_val = build_sentinel_token(session, device_id, "authorize_continue")
+                headers["openai-sentinel-token"] = sentinel_val
+                if oai_sc_val:
+                    session.cookies.set("oai-sc", oai_sc_val, domain=".openai.com")
+            except Exception:
+                pass
+            validate_resp = session.post(validate_url, headers=headers, json={"code": code}, timeout=30)
+        if validate_resp.status_code != 200:
+            return {"ok": False, "error": f"otp_validate_failed_{validate_resp.status_code}", "detail": self._safe_response_text(validate_resp)}
+
+        try:
+            validate_data = validate_resp.json() if validate_resp.text else {}
+        except Exception:
+            validate_data = {}
+        from urllib.parse import parse_qs, urlparse
+        continue_url = str(validate_data.get("continue_url") or "").strip()
+        auth_code = ""
+        if continue_url:
+            auth_code = str(parse_qs(urlparse(continue_url).query).get("code", [""])[0]).strip()
+        if not auth_code:
+            auth_code = str(parse_qs(urlparse(str(validate_resp.url or "")).query).get("code", [""])[0]).strip()
+        if not auth_code:
+            return {"ok": False, "error": "otp_no_auth_code", "detail": validate_data}
+        return {"ok": True, "auth_code": auth_code}
+
+    def _login_with_email_otp(self, email: str) -> dict:
+        """Passwordless login: authorize(login_hint) -> email-otp/send -> poll
+        resend-code-filter Worker for the code -> validate -> exchange tokens."""
+        from curl_cffi import requests
+
+        auth_base = "https://auth.openai.com"
+        platform_oauth_client_id = self._OAUTH_CLIENT_ID
+        platform_auth0_client = "eyJuYW...MCJ9"
+        user_agent = self._OAUTH_USER_AGENT
+
+        session_kwargs = {"impersonate": "chrome110", "verify": False}
+        proxy = config.get_proxy_settings()
+        if proxy:
+            session_kwargs["proxy"] = proxy
+        session = requests.Session(**session_kwargs)
+
+        try:
+            device_id = str(uuid.uuid4())
+            from utils.pkce import generate_pkce
+            code_verifier, code_challenge = generate_pkce()
+            session.cookies.set("oai-did", device_id, domain=".auth.openai.com")
+            session.cookies.set("oai-did", device_id, domain="auth.openai.com")
+
+            params = {
+                "issuer": auth_base,
+                "client_id": platform_oauth_client_id,
+                "audience": "https://api.openai.com/v1",
+                "redirect_uri": "https://platform.openai.com/auth/callback",
+                "device_id": device_id,
+                "screen_hint": "login",
+                "max_age": "0",
+                "login_hint": email,
+                "scope": "openid profile email offline_access",
+                "response_type": "code",
+                "response_mode": "query",
+                "state": secrets.token_urlsafe(32),
+                "nonce": secrets.token_urlsafe(32),
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+                "auth0Client": platform_auth0_client,
+            }
+            resp = session.get(
+                f"{auth_base}/api/accounts/authorize?{urlencode(params)}",
+                headers={
+                    "accept": "text/html,*/*",
+                    "user-agent": user_agent,
+                    "referer": "https://platform.openai.com/",
+                },
+                allow_redirects=True,
+                timeout=30,
+            )
+            if resp.status_code not in (200, 302):
+                return {"ok": False, "error": f"authorize_failed_{resp.status_code}", "detail": self._safe_response_text(resp)}
+            if "/error" in str(resp.url) and "payload=" in str(resp.url):
+                return {"ok": False, "error": "authorize_redirect_error", "detail": {"url": str(resp.url)[:300]}}
+
+            headers = {
+                "accept": "application/json",
+                "content-type": "application/json",
+                "origin": auth_base,
+                "user-agent": user_agent,
+                "oai-device-id": device_id,
+                "referer": f"{auth_base}/log-in",
+            }
+            send_resp = session.get(
+                f"{auth_base}/api/accounts/email-otp/send",
+                headers=headers,
+                allow_redirects=True,
+                timeout=30,
+            )
+            if send_resp.status_code not in (200, 302):
+                return {"ok": False, "error": f"otp_send_failed_{send_resp.status_code}", "detail": self._safe_response_text(send_resp)}
+            logger.info({"event": "otp_send_ok", "email": email, "mode": "otp_only_login"})
+
+            deadline = time.time() + self._OTP_POLL_TIMEOUT_SECS
+            code = ""
+            raw_payload: object = None
+            worker_url = str(getattr(config, "mail_code_worker_url", "") or "").strip().rstrip("/") or self._MAIL_CODE_WORKER_URL
+            while time.time() < deadline and not code:
+                try:
+                    poll_resp = session.get(
+                        f"{worker_url}/codes",
+                        headers={"user-agent": self._MAIL_CODE_WORKER_UA, "accept": "application/json"},
+                        timeout=15,
+                    )
+                    raw_payload = poll_resp.json() if poll_resp.status_code == 200 else None
+                    match = self._parse_worker_codes(raw_payload, email)
+                    if match:
+                        code = str(match.get("code") or "")
+                except Exception as exc:
+                    logger.warning({"event": "otp_poll_error", "email": email, "error": str(exc)})
+                if not code:
+                    time.sleep(self._OTP_POLL_INTERVAL_SECS)
+            if not code:
+                logger.warning({"event": "otp_poll_timeout", "email": email, "worker": worker_url, "payload": str(raw_payload)[:400]})
+                return {"ok": False, "error": "otp_code_timeout", "detail": {"worker": worker_url, "email": email}}
+            logger.info({"event": "otp_code_received", "email": email, "mode": "otp_only_login"})
+
+            validate_resp = session.post(
+                f"{auth_base}/api/accounts/email-otp/validate",
+                headers=headers,
+                json={"code": code},
+                timeout=30,
+            )
+            if validate_resp.status_code != 200:
+                try:
+                    from utils.sentinel import build_sentinel_token
+                    sentinel_val, oai_sc_val = build_sentinel_token(session, device_id, "authorize_continue")
+                    headers["openai-sentinel-token"] = sentinel_val
+                    if oai_sc_val:
+                        session.cookies.set("oai-sc", oai_sc_val, domain=".openai.com")
+                except Exception:
+                    pass
+                validate_resp = session.post(
+                    f"{auth_base}/api/accounts/email-otp/validate",
+                    headers=headers,
+                    json={"code": code},
+                    timeout=30,
+                )
+            if validate_resp.status_code != 200:
+                return {"ok": False, "error": f"otp_validate_failed_{validate_resp.status_code}", "detail": self._safe_response_text(validate_resp)}
+
+            try:
+                validate_data = validate_resp.json() if validate_resp.text else {}
+            except Exception:
+                validate_data = {}
+            continue_url = str(validate_data.get("continue_url") or "").strip()
+            auth_code = ""
+            if continue_url:
+                from urllib.parse import parse_qs, urlparse
+                auth_code = str(parse_qs(urlparse(continue_url).query).get("code", [""])[0]).strip()
+            if not auth_code:
+                from urllib.parse import parse_qs, urlparse
+                final_url = str(validate_resp.url or "")
+                if "code=" in final_url:
+                    auth_code = str(parse_qs(urlparse(final_url).query).get("code", [""])[0]).strip()
+            if not auth_code:
+                return {"ok": False, "error": "otp_no_auth_code", "detail": validate_data}
+
+            token_resp = session.post(
+                f"{auth_base}/api/accounts/oauth/token",
+                headers={
+                    "accept": "*/*",
+                    "content-type": "application/json",
+                    "origin": "https://platform.openai.com",
+                    "auth0Client": platform_auth0_client,
+                    "user-agent": user_agent,
+                },
+                json={
+                    "client_id": platform_oauth_client_id,
+                    "code_verifier": code_verifier,
+                    "grant_type": "authorization_code",
+                    "code": auth_code,
+                    "redirect_uri": "https://platform.openai.com/auth/callback",
+                },
+                verify=False,
+                timeout=60,
+            )
+            try:
+                token_data = token_resp.json() if token_resp.text else {}
+            except Exception:
+                token_data = {}
+            if token_resp.status_code != 200 or not token_data.get("access_token"):
+                return {"ok": False, "error": "token_exchange_failed", "detail": token_data}
+
+            access_token = str(token_data.get("access_token") or "").strip()
+            refresh_token = str(token_data.get("refresh_token") or "").strip()
+            id_token = str(token_data.get("id_token") or "").strip()
+
+            jwt_payload = self._decode_jwt_payload(access_token)
+            email_from_jwt = str(jwt_payload.get("https://api.openai.com/profile", {}).get("email") or "").strip()
+            account_id_from_jwt = str(
+                jwt_payload.get("https://api.openai.com/auth", {}).get("chatgpt_account_id") or ""
+            ).strip()
+            return {
+                "ok": True,
+                "email": email_from_jwt or email,
+                "account_id": account_id_from_jwt,
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "id_token": id_token,
+                "source_type": "email_otp",
+                "login_mode": "email_otp",
+            }
+        except Exception as exc:
+            logger.warning({"event": "otp_only_login_error", "email": email, "error": str(exc)})
+            return {"ok": False, "error": f"otp_login_exception: {exc}", "detail": {}}
 
     def _login_with_password(self, email: str, password: str) -> dict:
         """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}"""
@@ -743,8 +1204,12 @@ class AccountService:
                     page_type = str(page_info.get("type") or "")
                 
                 if page_type == "email_otp_verification":
-                    # 需要验证码才能登录，直接标记为账号异常
-                    return {"ok": False, "error": "need_verification_code", "detail": login_data}
+                    # 需要验证码：自动发送 OTP、从 resend-code-filter Worker 拉取验证码并校验
+                    otp_result = self._login_email_otp(session, device_id, email, user_agent, login_headers)
+                    if not otp_result.get("ok"):
+                        logger.warning({"event": "otp_login_failed", "email": email, "error": otp_result.get("error")})
+                        return {"ok": False, "error": otp_result.get("error"), "detail": otp_result.get("detail")}
+                    auth_code = str(otp_result.get("auth_code") or "").strip()
                 else:
                     return {"ok": False, "error": "no_auth_code", "detail": login_data}
             
@@ -1000,9 +1465,8 @@ class AccountService:
             if plan_type or source_type else f"no available image quota (tried {len(attempted_tokens)} tokens)"
         )
 
-    def get_text_access_token(self, excluded_tokens: set[str] | None = None, model: str = "") -> str:
+    def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
         excluded = set(excluded_tokens or set())
-        require_pro = model in PRO_MODELS
         with self._lock:
             now = datetime.now(timezone.utc)
             available: list[str] = []
@@ -1012,8 +1476,6 @@ class AccountService:
                 if not token or token in excluded:
                     continue
                 if account.get("status") in {"禁用", "异常"}:
-                    continue
-                if require_pro and str(account.get("type") or "").strip() not in {"Pro", "Team"}:
                     continue
                 until = self._parse_time(account.get("text_limited_until"))
                 if until is not None and until > now:
@@ -1037,12 +1499,64 @@ class AccountService:
             if current is None:
                 return
             next_item = dict(current)
-            next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            next_item["last_used_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            next_item["consecutive_429"] = 0
             account = self._normalize_account(next_item)
             if account is None:
                 return
             self._accounts[access_token] = account
             self._save_accounts()
+
+    def mark_text_failed(self, access_token: str, *, is_429: bool = False, event: str = "text_stream") -> bool:
+        """Record a failed text call. Deletes the account after N consecutive 429s."""
+        if not access_token:
+            return False
+        removed = False
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None:
+                return False
+            next_item = dict(current)
+            next_item["fail"] = int(next_item.get("fail") or 0) + 1
+            next_item["last_used_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            if is_429:
+                next_item["consecutive_429"] = int(next_item.get("consecutive_429") or 0) + 1
+            else:
+                next_item["consecutive_429"] = 0
+            account = self._normalize_account(next_item)
+            if account is None:
+                return False
+            streak = int(account.get("consecutive_429") or 0)
+            if is_429 and streak >= self._CONSECUTIVE_429_LIMIT:
+                # No longer delete the account: cool it down and retry after expiry.
+                email = str(account.get("email") or "")
+                until = (datetime.now(timezone.utc) + timedelta(minutes=max(1, int(config.text_429_cooldown_minutes)))).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                next_item["text_limited_until"] = until
+                next_item["consecutive_429"] = 0
+                account = self._normalize_account(next_item)
+                if account is None:
+                    return False
+                self._accounts[access_token] = account
+                self._save_accounts()
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    f"429连续{streak}次，暂停{config.text_429_cooldown_minutes}分钟",
+                    {"source": event, "token": anonymize_token(access_token), "email": email},
+                )
+                logger.warning({
+                    "event": "account_text_429_cooldown",
+                    "email": email,
+                    "streak": streak,
+                    "until": until,
+                    "token": anonymize_token(access_token),
+                })
+                return True
+            self._accounts[access_token] = account
+            self._save_accounts()
+        return removed
 
     def remove_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
         if not config.auto_remove_invalid_accounts:
@@ -1071,6 +1585,7 @@ class AccountService:
         若某账号该值持续 > 0，说明其并发槽位泄漏、已被静默排除出调度，可借此在 UI 上诊断。
         """
         with self._lock:
+            self._sync_accounts_from_storage_locked()
             result = []
             for item in self._accounts.values():
                 account = dict(item)
@@ -1081,6 +1596,7 @@ class AccountService:
 
     def list_limited_tokens(self) -> list[str]:
         with self._lock:
+            self._sync_accounts_from_storage_locked()
             return [
                 token
                 for item in self._accounts.values()
@@ -1090,6 +1606,7 @@ class AccountService:
 
     def list_normal_tokens(self) -> list[str]:
         with self._lock:
+            self._sync_accounts_from_storage_locked()
             return [
                 token
                 for item in self._accounts.values()
@@ -1154,6 +1671,7 @@ class AccountService:
             return {"added": 0, "skipped": 0, "items": self.list_accounts()}
 
         with self._lock:
+            self._sync_accounts_from_storage_locked()
             added = 0
             skipped = 0
             for access_token, payload in deduped.items():
@@ -1189,6 +1707,7 @@ class AccountService:
         if not target_set:
             return {"removed": 0, "items": self.list_accounts()}
         with self._lock:
+            self._sync_accounts_from_storage_locked()
             target_set = {self._resolve_access_token_locked(token) for token in target_set if token}
             removed = sum(self._accounts.pop(token, None) is not None for token in target_set)
             for token in target_set:
@@ -1203,7 +1722,7 @@ class AccountService:
                     self._index %= len(self._accounts)
                 else:
                     self._index = 0
-                self._save_accounts()
+                self._save_accounts(removed_tokens=target_set)
                 log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
@@ -1212,6 +1731,7 @@ class AccountService:
         if not access_token:
             return None
         with self._lock:
+            self._sync_accounts_from_storage_locked()
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
@@ -1221,7 +1741,7 @@ class AccountService:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
-                self._save_accounts()
+                self._save_accounts(removed_tokens={access_token})
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
@@ -1303,7 +1823,7 @@ class AccountService:
             if current is None:
                 return None
             next_item = dict(current)
-            next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            next_item["last_used_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             image_quota_unknown = bool(next_item.get("image_quota_unknown"))
             if success:
                 next_item["success"] = int(next_item.get("success") or 0) + 1
@@ -1535,15 +2055,23 @@ class AccountService:
                     continue
                 email = str(account.get("email") or "").strip()
                 password = str(account.get("password") or "").strip()
-                if not email or not password:
-                    continue
-                t = Thread(
-                    target=self._password_re_login_thread,
-                    args=(token, email, password, "auto_relogin_after_refresh"),
-                    daemon=True,
-                )
-                t.start()
-                relogined += 1
+                if email and password:
+                    t = Thread(
+                        target=self._password_re_login_thread,
+                        args=(token, email, password, "auto_relogin_after_refresh"),
+                        daemon=True,
+                    )
+                    t.start()
+                    relogined += 1
+                elif email and self._otp_relogin_allowed(account):
+                    # 无密码：走 email-OTP 免密登录（需域名邮件路由到验证码 Worker）
+                    t = Thread(
+                        target=self._otp_re_login_thread,
+                        args=(token, email, "auto_relogin_after_refresh"),
+                        daemon=True,
+                    )
+                    t.start()
+                    relogined += 1
 
         result = {
             "refreshed": refreshed,
@@ -1669,6 +2197,7 @@ class AccountService:
 
     def get_stats(self) -> dict:
         with self._lock:
+            self._sync_accounts_from_storage_locked()
             items = list(self._accounts.values())
         total = len(items)
         active = sum(1 for a in items if a.get("status") == "正常")

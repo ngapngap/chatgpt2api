@@ -10,7 +10,8 @@ services:
       CHATGPT2API_CONFIG_FILE: /app/config.json
       CHATGPT2API_PROXY_RUNTIME_ENABLED: ${CHATGPT2API_PROXY_RUNTIME_ENABLED:-true}
       CHATGPT2API_PROXY_RUNTIME_EGRESS_MODE: ${CHATGPT2API_PROXY_RUNTIME_EGRESS_MODE:-single_proxy}
-      CHATGPT2API_PROXY_RUNTIME_PROXY_URL: ${CHATGPT2API_PROXY_RUNTIME_PROXY_URL:-http://privoxy:8118}
+      CHATGPT2API_PROXY_RUNTIME_PROXY_URL: ${CHATGPT2API_PROXY_RUNTIME_PROXY_URL:-http://warp-egress-http-1:8118}
+      CHATGPT2API_PROXY_RUNTIME_PROXY_POOL: ${CHATGPT2API_PROXY_RUNTIME_PROXY_POOL:-http://warp-egress-http-1:8118,http://warp-egress-http-2:8118,http://warp-egress-http-3:8118,http://warp-egress-http-4:8118,http://warp-egress-http-5:8118}
       CHATGPT2API_PROXY_RUNTIME_RESOURCE_PROXY_URL: ${CHATGPT2API_PROXY_RUNTIME_RESOURCE_PROXY_URL:-}
       CHATGPT2API_PROXY_RUNTIME_SKIP_SSL_VERIFY: ${CHATGPT2API_PROXY_RUNTIME_SKIP_SSL_VERIFY:-false}
       CHATGPT2API_PROXY_RUNTIME_RESET_STATUS_CODES: ${CHATGPT2API_PROXY_RUNTIME_RESET_STATUS_CODES:-403}
@@ -24,47 +25,14 @@ services:
       CHATGPT2API_FLARESOLVERR_URL: ${CHATGPT2API_FLARESOLVERR_URL:-http://flaresolverr:8191}
     command: ["python3", "/app/scripts/init_proxy_config.py"]
     restart: "no"
-
-  warp-proxy:
-    image: caomingjun/warp:latest
-    container_name: chatgpt2api-warp-proxy
-    restart: unless-stopped
-    environment:
-      WARP_SLEEP: "2"
-      # 可选：填写 Cloudflare WARP+ License Key
-      # WARP_LICENSE_KEY: ${WARP_LICENSE_KEY:-}
-    cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
-    sysctls:
-      net.ipv6.conf.all.disable_ipv6: 0
-      net.ipv4.conf.all.src_valid_mark: 1
-    ports:
-      - "127.0.0.1:${WARP_SOCKS_PORT:-40000}:1080"
-    healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.create_connection(('127.0.0.1', 1080), 5); s.close()\""]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-
-  privoxy:
-    image: vimagick/privoxy:latest
-    container_name: chatgpt2api-privoxy
-    restart: unless-stopped
-    depends_on:
-      warp-proxy:
-        condition: service_started
-    volumes:
-      - ./scripts/privoxy-warp.conf:/etc/privoxy/config:ro
-    ports:
-      - "127.0.0.1:${PRIVOXY_PORT:-40080}:8118"
-    healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 8118 || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+    networks:
+      - default
+      - warp-egress
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
@@ -81,6 +49,11 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   app:
     build:
@@ -89,20 +62,54 @@ services:
     image: chatgpt2api:warp
     container_name: chatgpt2api-warp
     restart: unless-stopped
+    # autoheal restarts this container when its healthcheck goes unhealthy.
+    # Docker itself never restarts on unhealthy — the label is what turns the
+    # healthcheck above into an actual recovery action.
+    labels:
+      - "autoheal=true"
     depends_on:
       init-config:
         condition: service_completed_successfully
-      privoxy:
-        condition: service_started
       flaresolverr:
         condition: service_started
     ports:
-      - "${CHATGPT2API_PORT:-3000}:80"
+      - "127.0.0.1:${CHATGPT2API_PORT:-3000}:80"
+    command: ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--access-log", "--workers", "1"]
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
+      # Mount live Python services so multi-worker account-pool fixes apply
+      # without rebuilding the image every time.
+      - ./services:/app/services
+      - ./api:/app/api
     environment:
-      STORAGE_BACKEND: ${STORAGE_BACKEND:-json}
-      DATABASE_URL: ${DATABASE_URL:-}
+      TZ: Asia/Ho_Chi_Minh
+      STORAGE_BACKEND: "database"
+      DATABASE_URL: "sqlite:////app/data/accounts.db"
       CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
       CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+    networks:
+      - default
+      - warp-egress
+    # The app can wedge: uvicorn stays up, threads pile up on a futex and every
+    # route times out. Only a restart clears it, so let Docker notice and do it.
+    # python is used instead of curl — the image ships no HTTP client.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://127.0.0.1:80/health\", timeout=8).status==200 else 1)"'
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+networks:
+  default:
+  warp-egress:
+    external: true
+    name: warp-egress

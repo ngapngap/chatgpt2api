@@ -513,7 +513,10 @@ class OpenAIBackendAPI:
         if not base_model:
             return "auto"
         if base_model == "gpt-image-2":
-            return "gpt-5-3"
+            # The image "model" is only a chat model plus the picture_v2 hint, so
+            # which chat slug backs it decides quality. Configurable so the two
+            # can be compared without a rebuild; defaults to the newer slug.
+            return str(getattr(config, "image_chat_model_slug", "") or "gpt-6").strip()
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return "auto"

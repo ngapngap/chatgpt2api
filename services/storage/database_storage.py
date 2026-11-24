@@ -35,11 +35,26 @@ class DatabaseStorageBackend(StorageBackend):
 
     def __init__(self, database_url: str):
         self.database_url = database_url
+        connect_args = {}
+        if database_url.startswith("sqlite"):
+            # Multi-worker SQLite needs longer timeout under lock contention.
+            connect_args = {"timeout": 30, "check_same_thread": False}
         self.engine = create_engine(
             database_url,
             pool_pre_ping=True,  # 自动检测连接是否有效
             pool_recycle=3600,   # 1小时回收连接
+            connect_args=connect_args,
         )
+        if database_url.startswith("sqlite"):
+            from sqlalchemy import event
+
+            @event.listens_for(self.engine, "connect")
+            def _set_sqlite_pragma(dbapi_connection, connection_record):  # type: ignore[no-untyped-def]
+                cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA busy_timeout=30000")
+                cursor.close()
+
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine)
 
@@ -95,19 +110,33 @@ class DatabaseStorageBackend(StorageBackend):
     ) -> None:
         session = self.Session()
         try:
-            session.query(model).delete()
+            # Never wipe the whole table first. Multi-worker writers can race and
+            # accidentally delete accounts that another worker just imported.
+            field_name = target_key or source_key
+            db_attr = getattr(model, field_name)
+            incoming_keys: set[str] = set()
+
             for item in items:
                 if not isinstance(item, dict):
                     continue
                 key_value = str(item.get(source_key) or "").strip()
                 if not key_value:
                     continue
-                session.add(
-                    model(
-                        **{target_key or source_key: key_value},
-                        data=json.dumps(item, ensure_ascii=False),
-                    )
-                )
+                incoming_keys.add(key_value)
+
+                existing = session.query(model).filter(db_attr == key_value).first()
+                payload = json.dumps(item, ensure_ascii=False)
+                if existing:
+                    existing.data = payload
+                else:
+                    session.add(model(**{field_name: key_value}, data=payload))
+
+            if incoming_keys:
+                session.query(model).filter(~db_attr.in_(incoming_keys)).delete(synchronize_session=False)
+            else:
+                # Explicit empty list means "clear all" (delete path).
+                session.query(model).delete(synchronize_session=False)
+
             session.commit()
         except Exception as e:
             session.rollback()

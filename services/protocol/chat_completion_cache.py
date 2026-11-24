@@ -184,20 +184,28 @@ class ChatCompletionCache:
 
         now = time.time()
         max_entries = int(settings.get("max_entries") or 1)
+        # Never yield while holding the lock: this is a generator, so a yield
+        # inside the `with` suspends it holding the lock, and when the consumer
+        # disconnects the generator is closed from another thread — which then
+        # fails with "cannot release un-acquired lock". Copy the hit out, drop
+        # the lock, and yield afterwards.
         with self._lock:
             self._prune_locked(now, max_entries)
             entry = self._entries.get(key)
-            if entry and entry.expires_at > now:
-                yield from self._copy(entry.value)
-                return
-            inflight = self._inflight.get(key) if settings.get("dedupe_inflight") else None
-            if inflight is None:
-                inflight = InflightCall()
-                if settings.get("dedupe_inflight"):
-                    self._inflight[key] = inflight
-                owner = True
-            else:
-                owner = False
+            hit_value = self._copy(entry.value) if entry and entry.expires_at > now else None
+            inflight = None
+            owner = False
+            if hit_value is None:
+                inflight = self._inflight.get(key) if settings.get("dedupe_inflight") else None
+                if inflight is None:
+                    inflight = InflightCall()
+                    if settings.get("dedupe_inflight"):
+                        self._inflight[key] = inflight
+                    owner = True
+
+        if hit_value is not None:
+            yield from hit_value
+            return
 
         if not owner:
             with inflight.condition:

@@ -296,9 +296,14 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/health", response_model=None)
     async def health_dashboard(format: str = Query(default="html")):
         from services.account_service import account_service as acct_svc
-        stats = acct_svc.get_stats()
+
+        # get_stats() takes the account lock and reads the whole account table.
+        # Calling it straight from an async handler parked the event loop behind
+        # whatever was holding that lock, so /health hung along with the pool it
+        # was supposed to report on. Run it in the thread pool instead.
+        stats = await run_in_threadpool(acct_svc.get_stats)
         storage = config.get_storage_backend()
-        storage_health = storage.health_check()
+        storage_health = await run_in_threadpool(storage.health_check)
         healthy = stats["active"] > 0 or stats["unlimited_quota_count"] > 0
 
         stats_json = {
